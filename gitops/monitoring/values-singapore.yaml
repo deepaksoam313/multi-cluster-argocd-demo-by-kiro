@@ -1,0 +1,78 @@
+# kube-prometheus-stack values for gke-singapore (secondary cluster)
+# NO Grafana — metrics forwarded to Mumbai via remote_write
+# remote_write URL filled in by script after Mumbai Prometheus IP is known
+
+fullnameOverride: kube-prometheus-stack
+
+# ── Grafana (disabled — Mumbai has the single Grafana) ───────────────────────
+grafana:
+  enabled: false
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    externalLabels:
+      cluster: gke-singapore
+      region: asia-southeast1
+    # Short retention — metrics pushed to Mumbai anyway
+    retention: 6h
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "256Mi"
+      limits:
+        cpu: "300m"
+        memory: "512Mi"
+    # remote_write to Mumbai — URL set dynamically by script
+    remoteWrite:
+      - url: "http://8.234.93.217:9090/api/v1/write"
+        remoteTimeout: 30s
+        queueConfig:
+          capacity: 5000
+          maxSamplesPerSend: 2000
+          batchSendDeadline: 30s
+        writeRelabelConfigs:
+          - sourceLabels: [__name__]
+            regex: ".*"
+            action: keep
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+
+# ── Prometheus Operator ───────────────────────────────────────────────────────
+prometheusOperator:
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# ── AlertManager (disabled on secondary) ────────────────────────────────────
+alertmanager:
+  enabled: false
+
+# ── kube-state-metrics ───────────────────────────────────────────────────────
+kube-state-metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: "5m"
+      memory: "32Mi"
+    limits:
+      cpu: "100m"
+      memory: "64Mi"
+  metricLabelsAllowlist:
+    - pods=[app,region,cluster,version]
+    - deployments=[app,region,cluster]
+
+# ── node-exporter ─────────────────────────────────────────────────────────────
+prometheus-node-exporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: "5m"
+      memory: "32Mi"
+    limits:
+      cpu: "100m"
+      memory: "64Mi"

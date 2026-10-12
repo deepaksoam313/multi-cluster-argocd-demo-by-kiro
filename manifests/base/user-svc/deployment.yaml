@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-svc
+  namespace: microservices
+  labels:
+    app: user-svc
+    version: v1
+    managed-by: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-svc
+  template:
+    metadata:
+      labels:
+        app: user-svc
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/"
+    spec:
+      containers:
+        - name: user-svc
+          image: hashicorp/http-echo:latest
+          args:
+            - "-text=REGION_PLACEHOLDER"
+            - "-listen=:8080"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "50m"
+              memory: "64Mi"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5

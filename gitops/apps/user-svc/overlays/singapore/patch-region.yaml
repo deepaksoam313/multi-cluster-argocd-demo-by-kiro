@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-svc
+  namespace: microservices
+spec:
+  template:
+    metadata:
+      labels:
+        region: asia-southeast1
+        cluster: gke-singapore
+    spec:
+      containers:
+        - name: user-svc
+          args:
+            - "-text={\"service\":\"user\",\"region\":\"asia-southeast1\",\"cluster\":\"gke-singapore\",\"status\":\"ok\"}"
+            - "-listen=:8080"

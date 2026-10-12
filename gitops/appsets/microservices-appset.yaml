@@ -1,0 +1,68 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: microservices
+  namespace: argocd
+  # This ApplicationSet generates 6 Applications:
+  # order-svc-gke-mumbai, order-svc-gke-singapore
+  # product-svc-gke-mumbai, product-svc-gke-singapore
+  # user-svc-gke-mumbai, user-svc-gke-singapore
+spec:
+  generators:
+    - list:
+        elements:
+          # ── Mumbai cluster ─────────────────────────────────────
+          - cluster: gke-mumbai
+            url: https://kubernetes.default.svc
+            overlay: mumbai
+            app: order-svc
+          - cluster: gke-mumbai
+            url: https://kubernetes.default.svc
+            overlay: mumbai
+            app: product-svc
+          - cluster: gke-mumbai
+            url: https://kubernetes.default.svc
+            overlay: mumbai
+            app: user-svc
+          # ── Singapore cluster ───────────────────────────────────
+          - cluster: gke-singapore
+            url: https://34.143.165.98
+            overlay: singapore
+            app: order-svc
+          - cluster: gke-singapore
+            url: https://34.143.165.98
+            overlay: singapore
+            app: product-svc
+          - cluster: gke-singapore
+            url: https://34.143.165.98
+            overlay: singapore
+            app: user-svc
+
+  template:
+    metadata:
+      name: '{{app}}-{{cluster}}'
+    spec:
+      project: multi-region-demo
+      source:
+        # NOTE: In a real setup this would be a git remote URL.
+        # For lab mode, we reference the local path ArgoCD can resolve
+        # since the cluster is local. For multi-cluster we use direct apply.
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+        path: guestbook
+      destination:
+        server: '{{url}}'
+        namespace: microservices
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 1m

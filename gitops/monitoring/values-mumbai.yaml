@@ -1,0 +1,99 @@
+# kube-prometheus-stack values for gke-mumbai (primary cluster)
+# Key constraint: e2-medium nodes are CPU-request-saturated due to ArgoCD.
+# All CPU requests set to near-zero; limits are generous.
+# Memory is fine — nodes have ~60% free.
+
+fullnameOverride: kube-prometheus-stack
+
+# ── Grafana ──────────────────────────────────────────────────────────────────
+grafana:
+  enabled: true
+  adminPassword: "demo-password-123"
+  service:
+    type: LoadBalancer
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "128Mi"
+    limits:
+      cpu: "300m"
+      memory: "256Mi"
+  # Dashboards imported manually via UI after Grafana starts
+  # (grafana.com dashboard download disabled — network may block outbound)
+  # Grafana ini settings
+  grafana.ini:
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+prometheus:
+  prometheusSpec:
+    # Label every metric from this cluster
+    externalLabels:
+      cluster: gke-mumbai
+      region: asia-south1
+    # Accept remote_write from Singapore
+    enableRemoteWriteReceiver: true
+    # Short retention for lab
+    retention: 12h
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "400Mi"
+      limits:
+        cpu: "500m"
+        memory: "800Mi"
+    # Only scrape pods in our namespaces — reduces load
+    podMonitorNamespaceSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    # Scrape everything
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+
+# ── Prometheus Operator ───────────────────────────────────────────────────────
+prometheusOperator:
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# ── AlertManager ─────────────────────────────────────────────────────────────
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: "5m"
+        memory: "32Mi"
+      limits:
+        cpu: "100m"
+        memory: "64Mi"
+
+# ── kube-state-metrics ───────────────────────────────────────────────────────
+kube-state-metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: "5m"
+      memory: "32Mi"
+    limits:
+      cpu: "100m"
+      memory: "64Mi"
+  # Expose region/cluster labels on pod and deployment metrics
+  metricLabelsAllowlist:
+    - pods=[app,region,cluster,version]
+    - deployments=[app,region,cluster]
+
+# ── node-exporter ─────────────────────────────────────────────────────────────
+prometheus-node-exporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: "5m"
+      memory: "32Mi"
+    limits:
+      cpu: "100m"
+      memory: "64Mi"
