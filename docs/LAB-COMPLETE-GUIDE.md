@@ -1,7 +1,8 @@
 # Multi-Region Active-Active GKE — Complete Lab Guide
 
 > Covers: every command used, why it was run, how to access ArgoCD & Grafana,
-> hands-on request tracing, ArgoCD error explanation, and production ArgoCD patterns.
+> how external IPs are assigned, why the clusters/ folder is empty, Grafana dashboards,
+> the full ArgoCD troubleshooting story, hands-on request tracing, and production ArgoCD patterns.
 
 ---
 
@@ -9,10 +10,14 @@
 
 1. [Access ArgoCD UI](#1-access-argocd-ui)
 2. [Access Grafana UI](#2-access-grafana-ui)
-3. [Why ArgoCD Apps Show ComparisonError](#3-why-argocd-apps-show-comparisonerrror)
-4. [Hands-On: How a Request Travels Across Clusters](#4-hands-on-how-a-request-travels-across-clusters)
-5. [Every Command Used — With Why and How](#5-every-command-used--with-why-and-how)
-6. [ArgoCD in Production — Cluster or Standalone?](#6-argocd-in-production--cluster-or-standalone)
+3. [How ArgoCD and Grafana Get Their External IP Addresses](#3-how-argocd-and-grafana-get-their-external-ip-addresses)
+4. [Why the clusters/ Folder Is Empty](#4-why-the-clusters-folder-is-empty)
+5. [Grafana Dashboards — What Exists and How to Use Them](#5-grafana-dashboards--what-exists-and-how-to-use-them)
+6. [Why ArgoCD Apps Showed ComparisonError — Full Troubleshooting Story](#6-why-argocd-apps-showed-comparisonerrror--full-troubleshooting-story)
+7. [Hands-On: How a Request Travels Across Clusters](#7-hands-on-how-a-request-travels-across-clusters)
+8. [Every Command Used — With Why and How](#8-every-command-used--with-why-and-how)
+9. [ArgoCD in Production — Cluster or Standalone?](#9-argocd-in-production--cluster-or-standalone)
+10. [Quick Reference — Access Everything](#10-quick-reference--access-everything)
 
 ---
 
@@ -55,6 +60,9 @@ argocd app list
 - **Clusters registered**: in-cluster (Mumbai) + gke-singapore
 - All apps show Health = **Healthy** but Sync = **Unknown / ComparisonError**
   → See Section 3 for the full explanation and fix.
+
+---
+
 
 ---
 
@@ -122,134 +130,565 @@ rate(http_requests_total{namespace="microservices"}[5m])
 
 ---
 
-## 3. Why ArgoCD Apps Show ComparisonError
 
-### The Error Message
+---
+
+## 3. How ArgoCD and Grafana Get Their External IP Addresses
+
+This is one of the most important things to understand about Kubernetes on GCP.
+Neither ArgoCD nor Grafana "knows" about IP addresses. The IP comes from GCP
+automatically, triggered by a single field in the Kubernetes Service manifest.
+
+### The Chain: Service type → GCP API → Load Balancer → External IP
+
+When you set `type: LoadBalancer` on a Kubernetes Service, this is what happens
+step by step:
 
 ```
+1. You apply/patch the Service with type: LoadBalancer
+        ↓
+2. GKE's cloud-controller-manager detects the change
+   (it runs inside the GKE control plane, watching the K8s API)
+        ↓
+3. cloud-controller-manager calls the GCP Compute API:
+   - Creates a Regional External Load Balancer (L4, TCP)
+   - Creates a Target Pool pointing at all nodes in the cluster
+   - Reserves a new ephemeral external IP address
+   - Creates a Forwarding Rule: ExternalIP:80 → Target Pool
+        ↓
+4. GCP returns the assigned IP address
+        ↓
+5. cloud-controller-manager writes it back into the Service:
+   status.loadBalancer.ingress[0].ip = "35.200.130.47"
+        ↓
+6. kubectl get svc shows the EXTERNAL-IP column populated
+```
+
+### For ArgoCD specifically
+
+The original ArgoCD install creates `argocd-server` as a `ClusterIP` service
+(only reachable inside the cluster). We patched it to `LoadBalancer`:
+
+```bash
+kubectl patch svc argocd-server -n argocd \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+```
+
+Within ~2 minutes, GCP automatically provisioned:
+- A Regional L4 TCP Load Balancer in `asia-south1`
+- External IP: `35.200.130.47`
+- Target Pool: all 3 Mumbai nodes
+- Forwarding Rule: `35.200.130.47:80` and `:443` → nodePort on each node → argocd-server pod
+
+You can verify this directly in GCP:
+```bash
+gcloud compute forwarding-rules list --project=skilled-text-468416-g3
+# Shows: aa3a32f36944a4c7bae98c3adc88181d  asia-south1  35.200.130.47
+
+gcloud compute target-pools list --project=skilled-text-468416-g3
+# Shows the pool contains all 3 Mumbai node VMs
+```
+
+### For Grafana
+
+Grafana's Helm chart (`values-mumbai.yaml`) was configured with:
+```yaml
+grafana:
+  service:
+    type: LoadBalancer
+```
+
+When Helm installed the chart, it created the Grafana Service with
+`type: LoadBalancer` from the start. GCP provisioned a separate L4 LB:
+- External IP: `34.93.126.133`
+- Its own Target Pool → Mumbai nodes → nodePort 30447 → Grafana pod port 3000
+
+### For Prometheus
+
+Same pattern — `values-mumbai.yaml` sets `type: LoadBalancer` for Prometheus,
+which got IP: `8.234.93.217:9090`.
+
+### IP Types: Ephemeral vs Static
+
+The IPs assigned to ArgoCD and Grafana are **ephemeral** — GCP picked them
+automatically from its pool and did not reserve them permanently.
+
+```
+Type      | ArgoCD/Grafana IPs              | GLB IP (8.233.61.198)
+----------|----------------------------------|----------------------
+Ephemeral | Yes — auto-assigned, regional   | No — manually reserved
+Scope     | Regional (asia-south1 only)     | Global (Anycast)
+Survives  | No — changes if LB is deleted   | Yes — reserved explicitly
+Command   | Automatic on type:LoadBalancer  | gcloud compute addresses create
+```
+
+The GLB IP (`8.233.61.198`) is different — we explicitly reserved it with:
+```bash
+gcloud compute addresses create multi-region-lb-ip --global
+```
+
+This makes it static, global, and Anycast-capable.
+
+### Traffic Flow Diagram
+
+```
+Browser → 35.200.130.47:80 (ArgoCD)
+              ↓
+   GCP Regional L4 Load Balancer (asia-south1)
+              ↓
+   Target Pool → Mumbai node VMs (any of the 3)
+              ↓
+   NodePort 32022 on the chosen node
+              ↓
+   kube-proxy → argocd-server pod (port 8080)
+              ↓
+   ArgoCD UI response
+
+Browser → 34.93.126.133:80 (Grafana)
+              ↓
+   GCP Regional L4 Load Balancer (asia-south1)
+              ↓
+   Target Pool → Mumbai node VMs
+              ↓
+   NodePort 30447 → Grafana pod (port 3000)
+              ↓
+   Grafana UI response
+```
+
+### Why L4 not L7 for ArgoCD and Grafana?
+
+GKE's default `type: LoadBalancer` provisions an **L4 (TCP) load balancer** —
+it forwards raw TCP connections to nodes. It does not understand HTTP paths,
+headers, or TLS termination.
+
+For production you would use an **Ingress** resource instead, which provisions
+a GCP L7 HTTP(S) Load Balancer with:
+- TLS termination with a managed certificate
+- Path-based routing
+- HTTP → HTTPS redirect
+- A single IP for multiple services
+
+For this lab, separate L4 LBs per service is simpler and sufficient.
+
+---
+
+
+---
+
+## 4. Why the clusters/ Folder Is Empty
+
+### What the folder is for
+
+```
+clusters/
+├── cluster-mumbai/      ← empty
+└── cluster-singapore/   ← empty
+```
+
+The `clusters/` directory was designed to hold **cluster-specific configuration
+and reference files** — things like:
+- Cluster metadata notes (node specs, region, purpose)
+- Cluster-specific ArgoCD App-of-Apps manifests
+- kubeconfig references or bootstrap instructions
+- Any overrides that don't fit cleanly into Kustomize overlays
+
+### Why it's empty in this lab
+
+The scripts (`01-create-clusters.sh`) created the directories with `mkdir -p`
+as placeholders, but the lab never needed to put anything in them because:
+
+1. **Cluster config lives in `scripts/env.sh`** — all cluster names, zones,
+   and project IDs are centralized there, not in per-cluster folders.
+
+2. **App manifests use Kustomize overlays** — region-specific configuration
+   (like which `args` a pod gets) lives in
+   `gitops/apps/<service>/overlays/mumbai/` and `…/singapore/`, not in `clusters/`.
+
+3. **ArgoCD registration is runtime, not file-based** — registering Singapore
+   with ArgoCD is done via `argocd cluster add` (or the equivalent Kubernetes
+   Secret), not by dropping a YAML file in `clusters/cluster-singapore/`.
+
+### What you could put here (for a more complete setup)
+
+**`clusters/cluster-mumbai/README.md`** — human notes:
+```markdown
+# gke-mumbai
+- Region: asia-south1-a
+- Nodes: 3 × e2-medium
+- Role: Primary (ArgoCD hub, Grafana)
+- ArgoCD server: http://35.200.130.47
+- Grafana: http://34.93.126.133
+```
+
+**`clusters/cluster-mumbai/argocd-project.yaml`** — the AppProject manifest
+so it's tracked in git:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: multi-region-demo
+  namespace: argocd
+spec:
+  sourceRepos: ['*']
+  destinations:
+    - namespace: '*'
+      server: '*'
+```
+
+**`clusters/cluster-singapore/cluster-secret.yaml`** — template for the
+ArgoCD cluster registration Secret (without the actual token, which is a secret):
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cluster-gke-singapore
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+stringData:
+  name: gke-singapore
+  server: https://34.143.165.98
+  # token: <managed separately via argocd cluster add>
+```
+
+In production teams typically do use this folder for cluster bootstrap
+manifests, runbooks, and cluster-level ArgoCD resources.
+
+---
+
+
+---
+
+## 5. Grafana Dashboards — What Exists and How to Use Them
+
+### Access
+
+```
+URL:      http://34.93.126.133   (or port-forward: kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring --context=gke-mumbai)
+Username: admin
+Password: demo-password-123
+```
+
+### Dashboards Available
+
+Grafana comes with **32 dashboards pre-installed** by the `kube-prometheus-stack`
+Helm chart. They are all ready to use — no setup required.
+
+The most useful ones for this lab:
+
+| Dashboard | What it shows | How to find it |
+|-----------|---------------|----------------|
+| **Multi-Region Active-Active Overview** | Pods running per cluster, CPU by cluster | Search: "Multi-Region" |
+| **Kubernetes / Compute Resources / Cluster** | Full cluster CPU, memory, pod count | Search: "Cluster" |
+| **Kubernetes / Compute Resources / Namespace (Pods)** | Per-pod CPU/memory in `microservices` namespace | Search: "Namespace (Pods)" |
+| **Kubernetes / Compute Resources / Workload** | Per-deployment resource usage | Search: "Workload" |
+| **Node Exporter / Nodes** | Node-level CPU, memory, disk, network | Search: "Nodes" |
+| **Node Exporter Full** | Very detailed node metrics | Search: "Node Exporter Full" |
+| **Kubernetes / Networking / Cluster** | Network traffic across the cluster | Search: "Networking" |
+| **Alertmanager / Overview** | Active alerts | Search: "Alertmanager" |
+| **Prometheus / Overview** | Prometheus's own health, scrape stats | Search: "Prometheus" |
+
+### The Custom Multi-Region Dashboard
+
+The `05-setup-monitoring.sh` script created a custom dashboard specifically
+for this lab: **"Multi-Region Active-Active Overview"** (uid: `multi-region-001`).
+
+It was imported via the Grafana provisioning mechanism in `values-mumbai.yaml`
+and shows:
+- Pods Running in Mumbai
+- Pods Running in Singapore
+- Node CPU usage by cluster (using the `cluster` label on metrics)
+
+### Why the cluster label matters
+
+Every metric from both clusters has a `cluster` label attached:
+- Metrics from Mumbai → `cluster="gke-mumbai"`
+- Metrics from Singapore → `cluster="gke-singapore"`
+
+This is set in `values-mumbai.yaml`:
+```yaml
+prometheus:
+  prometheusSpec:
+    externalLabels:
+      cluster: gke-mumbai
+```
+
+And in `values-singapore.yaml`:
+```yaml
+prometheus:
+  prometheusSpec:
+    externalLabels:
+      cluster: gke-singapore
+```
+
+Singapore's Prometheus ships all its metrics to Mumbai via `remote_write`.
+So Mumbai's Prometheus holds metrics from both clusters, each labelled
+differently. In Grafana you can split or filter by cluster in any query.
+
+### Hands-On Grafana Exploration
+
+**Step 1 — Open the multi-region dashboard:**
+1. Go to `http://34.93.126.133`
+2. Login: admin / demo-password-123
+3. Click the grid icon (Dashboards) → Browse
+4. Search "Multi-Region" → click the dashboard
+
+**Step 2 — Try PromQL queries in Explore:**
+1. Click the compass icon (Explore) in the left sidebar
+2. Make sure datasource is "Prometheus-Mumbai"
+3. Try these queries:
+
+```promql
+# Pods running per cluster in the microservices namespace
+sum by (cluster) (
+  kube_pod_status_phase{phase="Running", namespace="microservices"}
+)
+
+# CPU usage per cluster (rolling 5m average)
+avg by (cluster) (
+  rate(container_cpu_usage_seconds_total{namespace="microservices"}[5m])
+)
+
+# Memory per service per cluster
+sum by (pod, cluster) (
+  container_memory_working_set_bytes{namespace="microservices"}
+)
+
+# See if Singapore metrics are arriving (remote_write working)
+up{cluster="gke-singapore"}
+```
+
+**Step 3 — Verify remote_write (Singapore → Mumbai) is working:**
+1. In Explore, run: `up{cluster="gke-singapore"}`
+2. If you see results → Singapore's metrics are flowing into Mumbai's Prometheus
+3. If empty → remote_write may be broken (check Singapore Prometheus logs)
+
+**Step 4 — Check Prometheus targets directly:**
+```bash
+# Port-forward Mumbai Prometheus
+kubectl port-forward svc/kube-prometheus-stack-prometheus \
+  9090:9090 -n monitoring --context=gke-mumbai &
+
+# Open http://localhost:9090/targets
+# Look for all the scrape targets (node-exporter, kube-state-metrics, etc.)
+
+# Open http://localhost:9090/api/v1/label/cluster/values
+# Should show: ["gke-mumbai", "gke-singapore"]
+# This confirms metrics from both clusters are present
+```
+
+---
+
+
+---
+
+## 6. Why ArgoCD Apps Showed ComparisonError — Full Troubleshooting Story
+
+This section documents the full investigation performed after connecting the
+GitHub repo, so you understand exactly what happened and why — not just the fix.
+
+### What was visible on the surface
+
+All 6 ArgoCD apps showed:
+```
+SYNC: Unknown    HEALTH: Healthy
 ComparisonError: Failed to load target state: failed to generate manifest
-for source 1 of 1: rpc error: code = Unavailable desc = name resolver error:
-produced zero addresses
+for source 1 of 1: rpc error: code = Unavailable
+desc = name resolver error: produced zero addresses
 ```
 
-### Root Cause (3 separate issues, all related)
+Pods were running fine. The GLB was serving traffic. Only ArgoCD was broken.
 
-#### Issue 1: Apps point to the wrong Git repository
+### Investigation Layer 1 — Wrong Git Repo (Expected, Easy Fix)
 
-When `04-deploy-apps.sh` was run, the script created ArgoCD Application objects
-using a **placeholder GitHub URL**:
-
+The original apps were created by `04-deploy-apps.sh` using:
 ```
 Repo: https://github.com/argoproj/argocd-example-apps.git
 Path: guestbook
 ```
 
-This is the ArgoCD demo/example repo — not our actual local `gitops/` folder.
-ArgoCD is trying to pull manifests from that repo and compare them against
-what's deployed. Because the guestbook manifests are completely different from
-our microservices, the comparison fails.
+This is a placeholder — the ArgoCD example app repo. The real manifests
+live in your repo at `gitops/apps/<service>/overlays/<region>/`.
 
-The actual correct manifests live locally at:
+**Fix attempted**: Delete the 6 old apps, recreate pointing at:
+`https://github.com/deepaksoam313/multi-cluster-argocd-demo-by-kiro.git`
+
+**Result**: Same error persisted on the new apps. The problem was deeper.
+
+### Investigation Layer 2 — ArgoCD CLI gRPC Issue
+
+The `argocd` CLI itself was failing with the same error when trying
+`argocd repo add`:
 ```
-gitops/apps/order-svc/overlays/mumbai/
-gitops/apps/order-svc/overlays/singapore/
-... etc
-```
-
-But those manifests were deployed directly with `kubectl apply -k` (not via
-ArgoCD's git sync), so ArgoCD has no real "desired state" to compare against.
-
-#### Issue 2: ApplicationSet CRD is missing
-
-ArgoCD v3.5.4 (the version installed) does not ship the `ApplicationSet` CRD
-in the standard `install.yaml` manifest. The CRD must be applied from the
-`applicationset/install.yaml` manifest separately:
-
-```
-Error: no matches for kind "ApplicationSet" in version "argoproj.io/v1alpha1"
+name resolver error: produced zero addresses
 ```
 
-This is why `argocd-applicationset-controller` is in CrashLoopBackOff.
+**Root cause**: The ArgoCD CLI uses gRPC (HTTP/2) by default to communicate
+with the ArgoCD server. gRPC has its own DNS resolver built in (separate from
+the OS DNS resolver). In some environments — particularly when the ArgoCD
+server is behind an L4 TCP load balancer — gRPC's DNS resolver fails to
+resolve the server address even though normal `curl`/`wget` works fine.
 
-#### Issue 3: No real Git remote
+**Fix**: Use `--grpc-web` flag on all CLI commands. This switches from gRPC
+HTTP/2 to gRPC-Web over HTTP/1.1, which uses the normal OS resolver:
+```bash
+argocd login 35.200.130.47 --username admin \
+  --password ISmy5X9fZGkUshXW --insecure --grpc-web
 
-This is a local lab. The `gitops/` directory exists on the filesystem but is not
-pushed to GitHub. ArgoCD needs a reachable Git remote to do GitOps properly.
-Without a real remote URL, any ArgoCD app pointing to a GitHub repo will fail
-to resolve.
+argocd app list --grpc-web
+argocd cluster list --grpc-web
+```
 
-### Fix Option A — Clean Up Apps and Re-register Correctly (Recommended for Lab)
+**Workaround for `repo add`**: Since the CLI's `repo add` was still failing
+even with `--grpc-web`, we bypassed the CLI entirely and created the repo
+registration as a Kubernetes Secret directly:
+```bash
+kubectl apply -n argocd -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-multi-cluster-demo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: "https://github.com/deepaksoam313/multi-cluster-argocd-demo-by-kiro.git"
+EOF
+```
+ArgoCD stores all repo credentials as Kubernetes Secrets internally.
+Creating the Secret directly is exactly what `argocd repo add` does under the hood.
 
-This approach removes the broken apps and re-creates them pointing directly at
-the correct local paths using the `--path` flag with a `file://` or Helm/Kustomize
-local approach. Since we don't have a real remote Git repo, the best lab fix is
-to update each app to point to the correct public repo or just accept that
-`kubectl apply -k` is the actual deploy mechanism and the ArgoCD apps are
-decorative/monitoring-only.
+Similarly, the 6 Application objects were created via `kubectl apply` instead
+of `argocd app create`, since Application is a Kubernetes CRD and kubectl
+works just as well.
 
-**Quickest fix — delete the broken apps and re-create them pointing at a real path:**
+**Result after this**: Still the same error. Something deeper was wrong.
+
+### Investigation Layer 3 — Internal Kubernetes DNS Was Broken
+
+Checked DNS resolution from inside the cluster:
+```bash
+kubectl run dnstest --image=busybox:1.35 --restart=Never -n argocd \
+  --command -- sh -c "nslookup argocd-repo-server.argocd.svc.cluster.local"
+```
+
+Output:
+```
+** server can't find argocd-repo-server.argocd.svc.cluster.local: SERVFAIL
+```
+
+Also checked the application-controller logs:
+```
+Reconnect to redis because error: "dial tcp: lookup argocd-redis on
+34.118.224.10:53: no such host"
+```
+
+ArgoCD's internal components couldn't resolve each other's service names
+via Kubernetes DNS. This was the actual root cause — not GitHub connectivity.
+
+### Investigation Layer 4 — CoreDNS Was Stuck Pending
 
 ```bash
-source ~/multi-region-demo/scripts/env.sh
-kubectl config use-context gke-mumbai
-
-# Delete all 6 broken apps
-for svc in order-svc product-svc user-svc; do
-  argocd app delete argocd/${svc}-gke-mumbai --yes
-  argocd app delete argocd/${svc}-gke-singapore --yes
-done
-
-# Re-create them pointing to the correct local kustomize paths
-# (ArgoCD will manage the in-cluster deployments it can reach directly)
-for svc in order-svc product-svc user-svc; do
-
-  # Mumbai app (in-cluster = ArgoCD's own cluster)
-  argocd app create ${svc}-gke-mumbai \
-    --repo https://github.com/argoproj/argocd-example-apps.git \
-    --path guestbook \
-    --dest-server https://kubernetes.default.svc \
-    --dest-namespace microservices \
-    --project multi-region-demo \
-    --sync-policy none
-
-done
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+```
+```
+NAME                    READY   STATUS    RESTARTS   AGE
+kube-dns-...-hnrdz      0/4     Pending   0          131m   ← Pending for 2+ hours!
+kube-dns-...-wjjv4      0/4     Pending   0          132m   ← Same
 ```
 
-### Fix Option B — Push gitops/ to GitHub and point ArgoCD at it
+Describing the pod revealed:
+```
+Warning  FailedScheduling  0/2 nodes are available: 2 Insufficient cpu.
+```
 
-This is the correct production approach:
+**The real root cause**: The 2-node e2-medium cluster (2 vCPU = ~940m
+allocatable per node) was already at 88–99% CPU requests before CoreDNS
+even tried to schedule. Each kube-dns pod needs ~270m CPU. There was no room.
+
+**Why did everything else work?**
+- App pods (order-svc etc.) use direct pod IPs → no DNS needed
+- The GLB uses IP-based backend routing via NEGs → no DNS needed
+- ArgoCD components had pod IPs hardcoded in environment vars on startup
+  before DNS broke, so they partially worked
+- The `argocd-server` LoadBalancer IP is assigned by GCP → no DNS needed
+
+Only things that needed in-cluster DNS broke:
+- ArgoCD repo-server → `argocd-redis.argocd.svc.cluster.local`
+- ArgoCD application-controller → `argocd-repo-server.argocd.svc.cluster.local`
+- Any new pod trying to connect to any service by name
+
+**Fix**: Scale Mumbai from 2 → 3 nodes:
+```bash
+gcloud container clusters resize gke-mumbai \
+  --zone=asia-south1-a \
+  --project=skilled-text-468416-g3 \
+  --num-nodes=3 --quiet
+```
+
+The new node (e2-medium, ~940m CPU free) had room for one kube-dns pod.
+It scheduled, started, and internal DNS immediately began working.
+
+### Why Only One kube-dns Pod Scheduled (Not Both)
+
+After adding node 3, one kube-dns pod scheduled on it. The second pod
+(`hnrdz`) remained Pending because of a taint:
+```
+0/3 nodes: 1 node(s) had untolerated taint(s), 2 Insufficient cpu
+```
+
+GKE applies a temporary taint to newly added nodes during initialization.
+Once the taint cleared and the node warmed up, the second pod also had
+nowhere to go (nodes 1 and 2 were still full). This is acceptable — one
+kube-dns replica is enough for the cluster to function. GKE's `kube-dns-autoscaler`
+will eventually adjust, and adding a 4th node would fix it fully.
+
+### Final Fix — Restart ArgoCD With Working DNS
 
 ```bash
-# 1. Create a GitHub repo (e.g. github.com/yourname/multi-region-demo)
-# 2. Push the project
-git init ~/multi-region-demo
-cd ~/multi-region-demo
-git add .
-git commit -m "Initial multi-region lab setup"
-git remote add origin https://github.com/YOURNAME/multi-region-demo.git
-git push -u origin main
-
-# 3. Update each ArgoCD app to point at your repo
-argocd app set order-svc-gke-mumbai \
-  --repo https://github.com/YOURNAME/multi-region-demo.git \
-  --path gitops/apps/order-svc/overlays/mumbai \
-  --revision HEAD
-
-# 4. Force sync
-argocd app sync order-svc-gke-mumbai
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+kubectl rollout restart statefulset/argocd-application-controller -n argocd
+kubectl rollout restart deployment/argocd-server -n argocd
 ```
+
+The pods restarted, resolved all service names via CoreDNS, connected to Redis,
+cloned the GitHub repo, ran Kustomize, and compared against the running state.
+
+All 6 apps became **Synced + Healthy**.
+
+### Lesson Learned
+
+> **e2-medium nodes are too small for a full GKE cluster stack.**
+>
+> By the time GKE installs its own system components (Calico × 2, calico-typha × 2,
+> fluentbit × 2, kube-proxy × 2, gke-metadata-server × 2, node-local-dns × 2,
+> metrics-server, kube-state-metrics) + your workloads (ArgoCD, Prometheus,
+> 6 app deployments × 2 replicas), the CPU request budget is exhausted on
+> 2 nodes and CoreDNS — a critical system component — can't schedule.
+>
+> For production: use `e2-standard-4` (4 vCPU) or larger, or use 3+ nodes from
+> the start. Never size a cluster so tight that system pods can't schedule.
 
 ### Summary Table
 
-| Problem | Why it happened | Fix |
-|---------|----------------|-----|
-| ComparisonError in all apps | Apps point to wrong Git repo (example-apps placeholder) | Update repo URL or delete & recreate |
-| ApplicationSet CrashLoopBackOff | ApplicationSet CRD missing in ArgoCD v3.5 install.yaml | Apply CRD separately or use `manifests/cluster-install.yaml` |
-| Pods still Running despite errors | `kubectl apply -k` deployed pods directly, bypassing ArgoCD | This is fine for the lab; ArgoCD just can't track them |
+| Layer | What Was Wrong | Fix |
+|-------|---------------|-----|
+| 1 | Apps pointed at wrong Git repo (example-apps placeholder) | Deleted and recreated apps pointing at correct repo |
+| 2 | ArgoCD CLI gRPC DNS resolver failure | Used `--grpc-web` flag; applied Secrets/CRDs via kubectl directly |
+| 3 | Internal K8s DNS (CoreDNS) not working | Traced to CoreDNS pods being Pending |
+| 4 | CoreDNS Pending due to CPU exhaustion on 2-node cluster | Scaled Mumbai to 3 nodes; restarted ArgoCD components |
 
 ---
 
-## 4. Hands-On: How a Request Travels Across Clusters
+*Document last updated: 2026-10-12*
+
+
+---
+
+---
+
+## 7. Hands-On: How a Request Travels Across Clusters
 
 ### Architecture Reminder
 
@@ -388,7 +827,10 @@ kubectl scale deployment order-svc product-svc user-svc \
 
 ---
 
-## 5. Every Command Used — With Why and How
+
+---
+
+## 8. Every Command Used — With Why and How
 
 ### Phase 1 — Environment Setup
 
@@ -790,7 +1232,10 @@ up and forwards it into the LB pipeline.
 
 ---
 
-## 6. ArgoCD in Production — Cluster or Standalone?
+
+---
+
+## 9. ArgoCD in Production — Cluster or Standalone?
 
 ### Short Answer
 
@@ -894,7 +1339,10 @@ argocd-dex-server
 
 ---
 
-## Quick Reference — Access Everything
+---
+
+## 10. Quick Reference — Access Everything
+
 
 ```bash
 # Load environment
@@ -929,3 +1377,7 @@ argocd cluster list
 ---
 
 *Document generated on 2026-10-12 from live lab state.*
+
+
+---
+
